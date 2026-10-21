@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+cameras.json
+viewer.log
+snapshots/
+records/
+events/
+reports/

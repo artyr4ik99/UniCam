@@ -1,0 +1,58 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name TiandyViewer tiandy_viewer.py
+
+      - name: Download ffmpeg + ffplay (recording/звук/hwaccel)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_extract
+          $exe = Get-ChildItem -Path ffmpeg_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $play = Get-ChildItem -Path ffmpeg_extract -Recurse -Filter ffplay.exe | Select-Object -First 1
+          Copy-Item $exe.FullName dist/ffmpeg.exe
+          Copy-Item $play.FullName dist/ffplay.exe
+
+      - name: Собрать архив релиза
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath TiandyViewer-windows.zip
+
+      - name: Upload artifact (доступен во вкладке Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TiandyViewer-windows
+          path: TiandyViewer-windows.zip
+
+      - name: Create GitHub Release (только при пуше тега vX.Y.Z)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: TiandyViewer-windows.zip
