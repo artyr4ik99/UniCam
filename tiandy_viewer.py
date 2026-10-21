@@ -345,6 +345,91 @@ def local_ips():
     return sorted(ips)
 
 
+def local_interfaces():
+    """Список (ip, netmask) локальных IPv4-интерфейсов этого компьютера (Ethernet,
+    Wi-Fi, VPN и т.д.) — через `ipconfig` на Windows и `ip addr` на Linux/macOS.
+    При любой ошибке парсинга падает обратно на local_ips() с маской /24."""
+    out = []
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["ipconfig"], capture_output=True, text=True,
+                               timeout=5, **_POPEN_FLAGS)
+            ip = None
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                m = re.match(r"IPv4.*?:\s*([\d.]+)", line)
+                if m:
+                    ip = m.group(1)
+                    continue
+                m = re.match(r"(?:Subnet Mask|Маска подсети)[^:]*:\s*([\d.]+)", line, re.I)
+                if m and ip:
+                    out.append((ip, m.group(1)))
+                    ip = None
+        else:
+            r = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True,
+                               text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                m = re.search(r"inet\s+([\d.]+)/(\d+)", line)
+                if m:
+                    mask = str(ipaddress.IPv4Network(f"0.0.0.0/{m.group(2)}").netmask)
+                    out.append((m.group(1), mask))
+    except Exception:
+        pass
+    return out or [(ip, "255.255.255.0") for ip in local_ips()]
+
+
+def routed_10_networks():
+    """CIDR сетей 10.x.x.x, до которых у компьютера есть МАРШРУТ (через шлюз —
+    например через управляемый коммутатор/роутер с несколькими VLAN), даже
+    если собственный IP компьютера не в сети 10.x.x.x (например, ПК в
+    192.168.x.x, а камеры — в 10.x.x.x за тем же коммутатором). Читает
+    системную таблицу маршрутизации: `route print` на Windows, `ip route`
+    на Linux/macOS."""
+    nets = set()
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["route", "print", "-4"], capture_output=True, text=True,
+                               timeout=5, **_POPEN_FLAGS)
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and re.match(r"^10(\.\d{1,3}){3}$", parts[0]):
+                    try:
+                        nets.add(str(ipaddress.ip_network(f"{parts[0]}/{parts[1]}", strict=False)))
+                    except ValueError:
+                        continue
+        else:
+            r = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                m = re.match(r"^10(\.\d{1,3}){3}/\d+", line)
+                if m:
+                    try:
+                        nets.add(str(ipaddress.ip_network(m.group(0), strict=False)))
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return nets
+
+
+def my_10_networks():
+    """CIDR сетей вида 10.x.x.x, которые ВИДНЫ этому компьютеру прямо сейчас —
+    либо потому что на одном из его адаптеров уже есть адрес в такой сети,
+    либо потому что в таблице маршрутизации есть путь к ней (через шлюз за
+    коммутатором/роутером). Используется кнопкой «Мои сети 10.x.x.x», чтобы не
+    требовать ручного ввода CIDR и не сканировать чужие/недоступные диапазоны
+    этого огромного приватного блока."""
+    nets = set()
+    for ip, mask in local_interfaces():
+        if not ip.startswith("10."):
+            continue
+        try:
+            nets.add(str(ipaddress.ip_network(f"{ip}/{mask}", strict=False)))
+        except ValueError:
+            continue
+    nets |= routed_10_networks()
+    return sorted(nets, key=lambda n: tuple(int(p) for p in n.split("/")[0].split(".")))
+
+
 def http_banner(ip, port):
     if not port:
         return ""
@@ -1419,12 +1504,15 @@ class ScanWindow(tk.Toplevel):
         self.progress = {"done": 0, "total": 0}
         self.busy = False
         self.rows = {}
+        self._scan_queue = []
+        self._current_net = None
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
         self.cidr = tk.StringVar(value=self._default_cidr())
         ttk.Label(top, text="Подсеть (например 10.0.0, 192.168.1.x или CIDR до /16):").pack(side="left")
         ttk.Entry(top, textvariable=self.cidr, width=22).pack(side="left", padx=4)
         ttk.Button(top, text="Сканировать порты", command=self.scan).pack(side="left")
+        ttk.Button(top, text="Мои сети 10.x.x.x", command=self.scan_my_10).pack(side="left", padx=4)
         ttk.Button(top, text="ONVIF-поиск", command=self.discover).pack(side="left", padx=4)
         ttk.Button(top, text="Подобрать пароли", command=self.guess_all).pack(side="left")
 
@@ -1488,7 +1576,8 @@ class ScanWindow(tk.Toplevel):
 
     def _tick(self):
         if self.busy and self.winfo_exists():
-            self.status.set(f"Сканирование… {self.progress['done']}/{self.progress['total']}")
+            extra = f" ({self._current_net})" if self._current_net else ""
+            self.status.set(f"Сканирование{extra}… {self.progress['done']}/{self.progress['total']}")
             self.after(200, self._tick)
 
     def scan(self):
@@ -1509,11 +1598,63 @@ class ScanWindow(tk.Toplevel):
                             "«Это моя сеть…» выше, чтобы подтвердить, что у вас есть право её сканировать.")
             return
         self.busy = True
+        self._current_net = str(net)
         self._tick()
         self.app.run_bg(lambda: scan_subnet(str(net), self.progress), self._on_scan)
 
+    def scan_my_10(self):
+        """Сканирует ВСЕ сети 10.x.x.x, к которым компьютер подключён прямо сейчас
+        (через любой сетевой адаптер) — то есть только те 10.x.x.x-сети, доступ
+        к которым у пользователя уже есть по факту. Не требует ручного ввода
+        подсети и не трогает остальной гигантский блок 10.0.0.0/8, к которому
+        компьютер не подключён."""
+        if self.busy:
+            return
+        nets = my_10_networks()
+        if not nets:
+            self.status.set("Не нашёл ни одной сети 10.x.x.x — ни на адаптерах компьютера, ни в "
+                            "таблице маршрутизации. Если камера на 10.x.x.x в той же L2-сети за "
+                            "обычным (неуправляемым) коммутатором без отдельного маршрута, "
+                            "добавьте компьютеру второй IP-адрес в сети 10.x.x.x в настройках "
+                            "сетевого адаптера и повторите, либо укажите подсеть вручную ниже.")
+            return
+        total_hosts = sum(ipaddress.ip_network(n).num_addresses for n in nets)
+        if total_hosts > SCAN_MAX_HOSTS:
+            self.status.set(f"Суммарно подключённые сети 10.x.x.x слишком большие "
+                            f"({total_hosts} адресов) — просканируйте их по одной через поле "
+                            f"подсети: {', '.join(nets)}")
+            return
+        self.busy = True
+        self._scan_queue = list(nets)
+        self.status.set(f"Найдены подключённые сети: {', '.join(nets)} — сканирую…")
+        self._tick()
+        self._scan_next()
+
+    def _scan_next(self):
+        if not self._scan_queue:
+            self.busy = False
+            self._current_net = None
+            self.status.set(f"Готово: просканированы мои сети 10.x.x.x, найдено устройств: {len(self.rows)}.")
+            self._render()
+            return
+        self._current_net = self._scan_queue.pop(0)
+        self.progress = {"done": 0, "total": 0}
+        self.app.run_bg(lambda n=self._current_net: scan_subnet(n, self.progress), self._on_scan_step)
+
+    def _on_scan_step(self, res):
+        if not isinstance(res, Exception):
+            for ip, d in res.items():
+                row = self.rows.setdefault(ip, {"ports": [], "info": ""})
+                row["ports"] = d["ports"]
+                row["info"] = d["info"] or row["info"]
+            self._render()
+        else:
+            self.app.log(f"Скан {self._current_net}: ошибка {res}")
+        self._scan_next()
+
     def _on_scan(self, res):
         self.busy = False
+        self._current_net = None
         if isinstance(res, Exception):
             self.status.set(f"Ошибка: {res}")
             return
